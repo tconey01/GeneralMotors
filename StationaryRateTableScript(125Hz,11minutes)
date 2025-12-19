@@ -1,0 +1,273 @@
+"""
+IMU Stationary Noise Test (For Allan Deviation)
+Collects stationary position data at high frequency for IMU noise validation.
+- Stationary IMU: Rate table is held at 0 degrees.
+- Duration: 11 minutes (660 seconds), meeting the >10 minute requirement.
+- Sample Rate: 125 Hz, meeting the >120 Hz requirement for a 60 Hz LPF IMU.
+- Filtering: Absolutely no data filtering (as required for Allan Deviation).
+"""
+
+import serial
+import time
+import csv
+import threading
+from datetime import datetime
+
+# === CONFIG ===
+COM_PORT = '/dev/tty.usbserial-FTEIZBTE'
+BAUD_RATE = 9600
+LOG_FILE = 'imu_stationary_noise_test.csv' 
+
+# --- STATIONARY TEST PARAMETERS (MODIFIED FOR ADEV) ---
+AMPLITUDE = 0       # degrees (SET TO 0: Stationary)
+FREQUENCY = 0.0     # Hz (SET TO 0: Stationary)
+DURATION = 660      # seconds (CHANGED: 11 minutes > 10 min requirement)
+NUM_CYCLES = 0      # cycles to run (SET TO 0)
+
+TARGET_SAMPLE_RATE = 125 # Hz (CHANGED: Needs to be >120 Hz to avoid aliasing)
+MIN_SAMPLE_INTERVAL = 1.0 / TARGET_SAMPLE_RATE
+
+# Globals (Initialized at the top level)
+ser = None
+logging_active = False
+test_start_time = None
+
+
+def connect_rate_table():
+    """Open serial connection to rate table."""
+    global ser
+    try:
+        ser = serial.Serial(COM_PORT, baudrate=BAUD_RATE, timeout=1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        print(f"Connected to {COM_PORT}")
+        return True
+    except Exception as e:
+        print(f"Connection failed: {e}")
+        return False
+
+
+def send_command(cmd, timeout=2.0, silent=False):
+    """Send command and wait for response."""
+    try:
+        ser.reset_input_buffer()
+        ser.write((cmd + '\r').encode())
+        
+        response = b''
+        start = time.time()
+        while time.time() - start < timeout:
+            if ser.in_waiting:
+                response += ser.read(ser.in_waiting)
+                if b'>' in response:
+                    break
+            time.sleep(0.001) 
+        
+        text = response.decode('ascii', errors='ignore')
+        text = text.replace('>', '').replace('\r', '').replace('\n', '').strip()
+        
+        if '?' in text:
+            return False, text
+        if not silent:
+            print(f"  {cmd}: {text if text else 'OK'}")
+        return True, text
+    except Exception as e:
+        return False, str(e)
+
+
+def query_position():
+    """Get current position (fast query) - optimized for high-rate."""
+    try:
+        ser.reset_input_buffer()
+        ser.write(b'PPO\r')
+        
+        response = b''
+        start = time.time()
+        while time.time() - start < MIN_SAMPLE_INTERVAL: 
+            if ser.in_waiting:
+                response += ser.read(ser.in_waiting)
+                if b'>' in response:
+                    break
+            time.sleep(0.0001) 
+        
+        val = response.decode('ascii', errors='ignore')
+        val = val.replace('>', '').replace('\r', '').replace('\n', '').strip()
+        if val.startswith('PPO'):
+            val = val[3:].strip()
+        return float(val) if val and '?' not in val else None
+    except:
+        return None
+
+
+def wait_for_motion_complete(timeout=60):
+    """Poll until table stops moving."""
+    start = time.time()
+    while time.time() - start < timeout:
+        ok, status = send_command('MCO5', silent=True)
+        if ok and status == '0':
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def initialize_rate_table():
+    """Home table and center it for the stationary test."""
+    print("\nInitializing for Stationary Test...")
+    
+    send_command('STO', silent=True)
+    time.sleep(1)
+    
+    print("  Homing...")
+    send_command('HOM')
+    if not wait_for_motion_complete():
+        print("  Home failed")
+        return False
+    
+    print("  Moving to 0 degrees...")
+    send_command('P0')
+    if not wait_for_motion_complete():
+        print("  Move to 0 failed")
+        return False
+    
+    send_command('PZR', silent=True)
+    
+    # Ensure motion parameters are set to zero
+    send_command(f'AMP{0}') 
+    send_command(f'FRQ{0}') 
+    send_command(f'CYC{0}') 
+    send_command('STO')
+    
+    return True
+
+
+def log_encoder_data():
+    """Background thread: log position to CSV (NO FILTERING)."""
+    global logging_active, test_start_time, ser 
+    
+    test_start_time = time.time()
+    sample_count = 0
+    last_sample_time = 0
+    
+    with open(LOG_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        f.write(f"# IMU Stationary Noise Test - {datetime.now()}\n")
+        f.write(f"# Duration: {DURATION} sec, Target Rate: {TARGET_SAMPLE_RATE} Hz\n")
+        f.write("# ---\n")
+        writer.writerow(['Timestamp', 'Time_Relative_sec', 'Position_deg'])
+        
+        while logging_active:
+            now = time.time()
+            if now - last_sample_time < MIN_SAMPLE_INTERVAL:
+                time.sleep(0.0001) 
+                continue
+            
+            # Check if test duration is met
+            if now - test_start_time > DURATION:
+                if ser and ser.is_open: 
+                    send_command('STO', silent=True)
+                logging_active = False
+                break 
+            
+            pos = query_position()
+            if pos is None:
+                continue
+            
+            # ABSOLUTELY NO FILTERING (as requested for ADEV)
+            
+            t_rel = now - test_start_time
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            writer.writerow([ts, f'{t_rel:.6f}', f'{pos:.4f}'])
+            
+            sample_count += 1
+            last_sample_time = now
+            
+            # Progress (every 600 samples ~ 5 seconds at 125Hz)
+            if sample_count % 600 == 0:
+                rate = sample_count / t_rel if t_rel > 0 else 0
+                print(f"  {sample_count} samples | {t_rel:.0f}s | {pos:.1f} deg | Actual Rate: {rate:.1f} Hz")
+                f.flush()
+    
+    print(f"\nLogged {sample_count} samples to {LOG_FILE}")
+
+
+def run_test():
+    """Execute stationary test (no motion commanded, just wait)."""
+    global logging_active
+    
+    print("\nStarting stationary data collection in 3...")
+    time.sleep(1)
+    print("2...")
+    time.sleep(1)
+    print("1...")
+    time.sleep(1)
+    
+    send_command('STO') 
+    
+    print(f"Collecting stationary data for {DURATION} seconds...")
+    
+    # Wait for logging thread to hit the duration limit
+    start = time.time()
+    while time.time() - start < DURATION + 5 and logging_active:
+        time.sleep(1)
+    
+    send_command('STO')
+    logging_active = False 
+    print("Test complete.")
+
+
+def cleanup():
+    """Stops the rate table and cleans up serial connection on KeyboardInterrupt."""
+    # Dedicated function for cleanup logic
+    global logging_active, ser
+
+    # 1. Stop logging
+    logging_active = False
+
+    # 2. Stop the table and close serial
+    if ser and ser.is_open:
+        send_command('STO', silent=True)
+        ser.close()
+    print("Cleanup complete.")
+
+
+def main():
+    print("="*50)
+    print("IMU STATIONARY NOISE TEST (Allan Deviation)")
+    print("="*50)
+    
+    print(f"Target Duration: {DURATION}s ({DURATION/60:.1f} min)")
+    print(f"Target Sample Rate: {TARGET_SAMPLE_RATE} Hz")
+    print("IMU will be stationary (0 deg) with NO filtering.")
+    
+    if not connect_rate_table():
+        return
+    if not initialize_rate_table():
+        return
+    
+    print("\n*** Start your IMU logging now ***")
+    input("Press ENTER when ready to start stationary collection...")
+    
+    # NOTE: logging_active is only assigned and accessed here, not declared global, 
+    # as Python finds the global definition at the top of the module.
+    global logging_active
+    logging_active = True
+    log_thread = threading.Thread(target=log_encoder_data)
+    log_thread.start()
+    
+    time.sleep(2)  # let logger start
+    run_test()
+    
+    log_thread.join(timeout=10)
+    ser.close()
+    print("Done. Use the log file for Allan Deviation analysis.")
+
+
+if __name__ == "__main__":
+    # Removed 'global ser, logging_active' here to fix the SyntaxError,
+    # as the module's top-level definitions are sufficient, and calling 'main()'
+    # handles the assignment.
+    try:
+        main()
+    except KeyboardInterrupt:
+        # The 'cleanup' function handles the necessary global declarations internally.
+        cleanup()
