@@ -1,0 +1,105 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import allantools
+
+# === CONFIGURATION ===
+INPUT_FILE = 'signal_data2.csv'
+DISCARD_RATIO = 0.1  # Discard first 10% (startup settling)
+
+def analyze_3axis_adev():
+    print(f"Processing {INPUT_FILE}...")
+
+    # 1. LOAD DATA (Skipping 'sep=,' line)
+    try:
+        # skiprows=1 skips the 'sep=,' line so the header is read correctly
+        # usecols=[0, 1, 3, 5] grabs Time, Rate1, Rate2, Rate3
+        df = pd.read_csv(INPUT_FILE, skiprows=1, usecols=[0, 1, 3, 5], encoding='latin1')
+        
+        # Rename for clarity
+        df.columns = ['Time', 'Rate_1', 'Rate_2', 'Rate_3']
+        
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+
+    # 2. PRE-PROCESS (Discard startup transients)
+    total_samples = len(df)
+    start_idx = int(total_samples * DISCARD_RATIO)
+    df = df.iloc[start_idx:].reset_index(drop=True)
+    
+    print(f"Analyzing {len(df)} samples (Discarded first {DISCARD_RATIO*100:.0f}%)")
+
+    # 3. CALCULATE SAMPLE RATE
+    try:
+        # Convert Time to numeric
+        t_vals = pd.to_numeric(df['Time'], errors='coerce')
+        
+        # Calculate median time difference to determine rate
+        dt = t_vals.diff().median()
+        
+        if dt == 0 or np.isnan(dt):
+            print("Error: Could not determine sample rate. Check Time column.")
+            return
+
+        fs = 1.0 / dt
+        print(f"Detected Sample Rate: {fs:.2f} Hz")
+        
+    except Exception as e:
+        print(f"Error calculating rate: {e}")
+        return
+
+    # 4. CALCULATE & PLOT ADEV FOR 3 AXES
+    axes = ['Rate_1', 'Rate_2', 'Rate_3']
+    colors = ['r', 'g', 'b']
+    
+    plt.figure(figsize=(10, 8))
+    print("\nCalculating Allan Deviation...")
+
+    results = {}
+
+    for i, axis in enumerate(axes):
+        # Force numeric conversion (handling potential empty strings)
+        data = pd.to_numeric(df[axis], errors='coerce').dropna().values
+        
+        if len(data) < 100:
+            print(f"Warning: Not enough valid data for {axis}")
+            continue
+
+        # Calculate ADEV (Input is RATE, so data_type="freq")
+        (taus, adev, adev_err, ns) = allantools.oadev(data, rate=fs, data_type='freq', taus='all')
+        
+        # Store for reference line calculation
+        results[axis] = (taus, adev)
+
+        # Plot
+        plt.loglog(taus, adev, color=colors[i], linewidth=1.5, label=axis)
+        print(f" - {axis} done.")
+
+    # 5. ADD REFERENCE LINE (Slope -0.5 for White Noise)
+    # Uses the first valid axis to anchor the reference line
+    if results:
+        first_axis = list(results.keys())[0]
+        ref_taus, ref_adev = results[first_axis]
+        
+        # Anchor line to the middle of the graph
+        mid = len(ref_taus) // 4
+        if mid < len(ref_taus):
+            k = ref_adev[mid] * np.sqrt(ref_taus[mid])
+            line_arw = k / np.sqrt(ref_taus)
+            plt.loglog(ref_taus, line_arw, '--', color='gray', alpha=0.7, label='Slope -0.5 (Reference)')
+
+    # 6. FINALIZE PLOT
+    plt.grid(True, which="both", ls="-", alpha=0.4)
+    plt.title(f"Allan Deviation - 3-Axis Gyro\n(Fs={fs:.1f} Hz)")
+    plt.xlabel(r"Tau $\tau$ [s]")
+    plt.ylabel(r"Allan Deviation $\sigma(\tau)$ [deg/s]")
+    plt.legend()
+    
+    outfile = "adev_3axis_plot.png"
+    plt.savefig(outfile)
+    print(f"\nPlot saved to {outfile}")
+    plt.show()
+
+if __name__ == "__main__":
+    analyze_3axis_adev()
